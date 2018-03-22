@@ -18,6 +18,7 @@ PACKAGES = find_packages()
 
 
 MOD_NAMES = [
+    'spacy._align',
     'spacy.parts_of_speech',
     'spacy.strings',
     'spacy.lexeme',
@@ -189,17 +190,17 @@ def setup_package():
                 'murmurhash>=0.28,<0.29',
                 'cymem>=1.30,<1.32',
                 'preshed>=1.0.0,<2.0.0',
-                'thinc>=6.10.1,<6.11.0',
+                'thinc>=6.11.1.dev7,<6.12.0',
                 'plac<1.0.0,>=0.9.6',
-                'six',
                 'pathlib',
                 'ujson>=1.35',
                 'dill>=0.2,<0.3',
                 'requests>=2.13.0,<3.0.0',
                 'regex==2017.4.5',
                 'ftfy>=4.4.2,<5.0.0',
-                'msgpack-python',
+                'msgpack-python==0.5.4',
                 'msgpack-numpy==0.4.1'],
+            setup_requires=['wheel'],
             classifiers=[
                 'Development Status :: 5 - Production/Stable',
                 'Environment :: Console',

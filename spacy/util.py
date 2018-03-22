@@ -17,6 +17,7 @@ from thinc.neural._classes.model import Model
 import functools
 import cytoolz
 import itertools
+import numpy.random
 
 from .symbols import ORTH
 from .compat import cupy, CudaStream, path2str, basestring_, input_, unicode_
@@ -435,6 +436,29 @@ def decaying(start, stop, decay):
         nr_upd += 1
 
 
+def minibatch_by_words(items, size, count_words=len):
+    '''Create minibatches of a given number of words.'''
+    if isinstance(size, int):
+        size_ = itertools.repeat(size)
+    else:
+        size_ = size
+    items = iter(items)
+    while True:
+        batch_size = next(size_)
+        batch = []
+        while batch_size >= 0:
+            try:
+                doc, gold = next(items)
+            except StopIteration:
+                if batch:
+                    yield batch
+                return
+            batch_size -= count_words(doc)
+            batch.append((doc, gold))
+        if batch:
+            yield batch
+
+
 def itershuffle(iterable, bufsize=1000):
     """Shuffle an iterator. This works by holding `bufsize` items back
     and yielding them sometime later. Obviously, this is not unbiased –
@@ -450,7 +474,7 @@ def itershuffle(iterable, bufsize=1000):
     try:
         while True:
             for i in range(random.randint(1, bufsize-len(buf))):
-                buf.append(iterable.next())
+                buf.append(next(iterable))
             random.shuffle(buf)
             for i in range(random.randint(1, bufsize)):
                 if buf:
@@ -623,3 +647,8 @@ def use_gpu(gpu_id):
     Model.ops = CupyOps()
     Model.Ops = CupyOps
     return device
+
+
+def fix_random_seed(seed=0):
+    random.seed(seed)
+    numpy.random.seed(seed)

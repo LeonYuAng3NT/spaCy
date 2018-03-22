@@ -17,6 +17,7 @@ from .vocab import Vocab
 from .lemmatizer import Lemmatizer
 from .pipeline import DependencyParser, Tensorizer, Tagger, EntityRecognizer
 from .pipeline import SimilarityHook, TextCategorizer, SentenceSegmenter
+from .pipeline import merge_noun_chunks, merge_entities, merge_subtokens
 from .compat import json_dumps, izip, basestring_
 from .gold import GoldParse
 from .scorer import Scorer
@@ -105,7 +106,10 @@ class Language(object):
         'similarity': lambda nlp, **cfg: SimilarityHook(nlp.vocab, **cfg),
         'textcat': lambda nlp, **cfg: TextCategorizer(nlp.vocab, **cfg),
         'sbd': lambda nlp, **cfg: SentenceSegmenter(nlp.vocab, **cfg),
-        'sentencizer': lambda nlp, **cfg: SentenceSegmenter(nlp.vocab, **cfg)
+        'sentencizer': lambda nlp, **cfg: SentenceSegmenter(nlp.vocab, **cfg),
+        'merge_noun_chunks': lambda nlp, **cfg: merge_noun_chunks,
+        'merge_entities': lambda nlp, **cfg: merge_entities,
+        'merge_subtokens': lambda nlp, **cfg: merge_subtokens,
     }
 
     def __init__(self, vocab=True, make_doc=True, meta={}, **kwargs):
@@ -236,6 +240,14 @@ class Language(object):
             >>> nlp.add_pipe(component, before='ner')
             >>> nlp.add_pipe(component, name='custom_name', last=True)
         """
+        if not hasattr(component, '__call__'):
+            msg = ("Not a valid pipeline component. Expected callable, but "
+                   "got {}. ".format(repr(component)))
+            if isinstance(component, basestring_) and component in self.factories:
+                msg += ("If you meant to add a built-in component, use "
+                        "create_pipe: nlp.add_pipe(nlp.create_pipe('{}'))"
+                        .format(component))
+            raise ValueError(msg)
         if name is None:
             if hasattr(component, 'name'):
                 name = component.name
@@ -453,7 +465,8 @@ class Language(object):
             if hasattr(proc, 'begin_training'):
                 proc.begin_training(get_gold_tuples(),
                                     pipeline=self.pipeline,
-                                    sgd=self._optimizer)
+                                    sgd=self._optimizer,
+                                    **cfg)
         return self._optimizer
 
     def evaluate(self, docs_golds, verbose=False):
@@ -615,7 +628,7 @@ class Language(object):
         deserializers = OrderedDict((
             ('vocab', lambda p: self.vocab.from_disk(p)),
             ('tokenizer', lambda p: self.tokenizer.from_disk(p, vocab=False)),
-            ('meta.json', lambda p: self.meta.update(ujson.load(p.open('r'))))
+            ('meta.json', lambda p: self.meta.update(util.read_json(p)))
         ))
         for name, proc in self.pipeline:
             if name in disable:
@@ -711,5 +724,5 @@ class DisabledPipes(list):
 
 def _pipe(func, docs):
     for doc in docs:
-        func(doc)
+        doc = func(doc)
         yield doc

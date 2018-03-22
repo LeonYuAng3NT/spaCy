@@ -6,18 +6,14 @@ from pathlib import Path
 import tqdm
 from thinc.neural._classes.model import Model
 from timeit import default_timer as timer
-import random
-import numpy.random
 
-from ..gold import GoldCorpus, minibatch
-from ..util import prints
+from ..attrs import PROB, IS_OOV, CLUSTER, LANG
+from ..gold import GoldCorpus
+from ..util import prints, minibatch, minibatch_by_words
 from .. import util
 from .. import about
 from .. import displacy
 from ..compat import json_dumps
-
-random.seed(0)
-numpy.random.seed(0)
 
 
 @plac.annotations(
@@ -34,25 +30,27 @@ numpy.random.seed(0)
     no_tagger=("Don't train tagger", "flag", "T", bool),
     no_parser=("Don't train parser", "flag", "P", bool),
     no_entities=("Don't train NER", "flag", "N", bool),
+    parser_multitasks=("Side objectives for parser CNN, e.g. dep dep,tag", "option", "pt", str),
+    entity_multitasks=("Side objectives for ner CNN, e.g. dep dep,tag", "option", "et", str),
     gold_preproc=("Use gold preprocessing", "flag", "G", bool),
     version=("Model version", "option", "V", str),
     meta_path=("Optional path to meta.json. All relevant properties will be "
                "overwritten.", "option", "m", Path))
 def train(lang, output_dir, train_data, dev_data, n_iter=30, n_sents=0,
+         parser_multitasks='', entity_multitasks='',
           use_gpu=-1, vectors=None, no_tagger=False,
           no_parser=False, no_entities=False, gold_preproc=False,
           version="0.0.0", meta_path=None):
     """
     Train a model. Expects data in spaCy's JSON format.
     """
+    util.fix_random_seed()
     util.set_env_log(True)
     n_sents = n_sents or None
     output_path = util.ensure_path(output_dir)
     train_path = util.ensure_path(train_data)
     dev_path = util.ensure_path(dev_data)
     meta_path = util.ensure_path(meta_path)
-    if not output_path.exists():
-        output_path.mkdir()
     if not train_path.exists():
         prints(train_path, title="Training data not found", exits=1)
     if dev_path and not dev_path.exists():
@@ -65,7 +63,14 @@ def train(lang, output_dir, train_data, dev_data, n_iter=30, n_sents=0,
                title="Not a valid meta.json format", exits=1)
     meta.setdefault('lang', lang)
     meta.setdefault('name', 'unnamed')
+    
+    if not output_path.exists():
+        output_path.mkdir()
 
+    print("Counting training words (limit=%s" % n_sents)
+    corpus = GoldCorpus(train_path, dev_path, limit=n_sents)
+    n_train_words = corpus.count_train()
+    print(n_train_words)
     pipeline = ['tagger', 'parser', 'ner']
     if no_tagger and 'tagger' in pipeline:
         pipeline.remove('tagger')
@@ -81,41 +86,52 @@ def train(lang, output_dir, train_data, dev_data, n_iter=30, n_sents=0,
     dropout_rates = util.decaying(util.env_opt('dropout_from', 0.2),
                                   util.env_opt('dropout_to', 0.2),
                                   util.env_opt('dropout_decay', 0.0))
-    batch_sizes = util.compounding(util.env_opt('batch_from', 1),
-                                   util.env_opt('batch_to', 16),
+    batch_sizes = util.compounding(util.env_opt('batch_from', 1000),
+                                   util.env_opt('batch_to', 1000),
                                    util.env_opt('batch_compound', 1.001))
-    max_doc_len = util.env_opt('max_doc_len', 5000)
-    corpus = GoldCorpus(train_path, dev_path, limit=n_sents)
-    n_train_words = corpus.count_train()
-
     lang_class = util.get_lang_class(lang)
     nlp = lang_class()
     meta['pipeline'] = pipeline
     nlp.meta.update(meta)
     if vectors:
         util.load_model(vectors, vocab=nlp.vocab)
+        for lex in nlp.vocab:
+            values = {}
+            for attr, func in nlp.vocab.lex_attr_getters.items():
+                # These attrs are expected to be set by data. Others should
+                # be set by calling the language functions.
+                if attr not in (CLUSTER, PROB, IS_OOV, LANG):
+                    values[lex.vocab.strings[attr]] = func(lex.orth_)
+            lex.set_attrs(**values)
+            lex.is_oov = False
     for name in pipeline:
         nlp.add_pipe(nlp.create_pipe(name), name=name)
+    nlp.add_pipe(nlp.create_pipe('merge_subtokens'))
+    if parser_multitasks:
+        for objective in parser_multitasks.split(','):
+            nlp.parser.add_multitask_objective(objective)
+    if entity_multitasks:
+        for objective in entity_multitasks.split(','):
+            nlp.entity.add_multitask_objective(objective)
     optimizer = nlp.begin_training(lambda: corpus.train_tuples, device=use_gpu)
     nlp._optimizer = None
 
     print("Itn.\tP.Loss\tN.Loss\tUAS\tNER P.\tNER R.\tNER F.\tTag %\tToken %")
     try:
-        train_docs = corpus.train_docs(nlp, projectivize=True, noise_level=0.0,
-                                       gold_preproc=gold_preproc, max_length=0)
-        train_docs = list(train_docs)
         for i in range(n_iter):
+            train_docs = corpus.train_docs(nlp, noise_level=0.0,
+                                           gold_preproc=gold_preproc, max_length=0)
+            words_seen = 0
             with tqdm.tqdm(total=n_train_words, leave=False) as pbar:
                 losses = {}
-                for batch in minibatch(train_docs, size=batch_sizes):
-                    batch = [(d, g) for (d, g) in batch if len(d) < max_doc_len]
+                for batch in minibatch_by_words(train_docs, size=batch_sizes):
                     if not batch:
                         continue
                     docs, golds = zip(*batch)
                     nlp.update(docs, golds, sgd=optimizer,
                                drop=next(dropout_rates), losses=losses)
                     pbar.update(sum(len(doc) for doc in docs))
-
+                    words_seen += sum(len(doc) for doc in docs)
             with nlp.use_params(optimizer.averages):
                 util.set_env_log(False)
                 epoch_model_path = output_path / ('model%d' % i)

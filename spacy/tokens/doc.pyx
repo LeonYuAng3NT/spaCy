@@ -186,6 +186,20 @@ cdef class Doc:
     def _(self):
         return Underscore(Underscore.doc_extensions, self)
 
+    @property
+    def is_sentenced(self):
+        # Check if the document has sentence boundaries,
+        # i.e at least one tok has the sent_start in (-1, 1)
+        if 'sents' in self.user_hooks:
+            return True
+        if self.is_parsed:
+            return True
+        for i in range(self.length):
+            if self.c[i].sent_start == -1 or self.c[i].sent_start == 1:
+                return True
+        else:
+            return False
+
     def __getitem__(self, object i):
         """Get a `Token` or `Span` object.
 
@@ -515,29 +529,23 @@ cdef class Doc:
             >>> assert [s.root.text for s in doc.sents] == ["is", "'s"]
         """
         def __get__(self):
+            if not self.is_sentenced:
+                raise ValueError(
+                    "Sentence boundaries unset. You can add the 'sentencizer' "
+                    "component to the pipeline with: "
+                    "nlp.add_pipe(nlp.create_pipe('sentencizer')) "
+                    "Alternatively, add the dependency parser, or set "
+                    "sentence boundaries by setting doc[i].sent_start")
             if 'sents' in self.user_hooks:
                 yield from self.user_hooks['sents'](self)
-                return
-
-            cdef int i
-            if not self.is_parsed:
+            else:
+                start = 0
                 for i in range(1, self.length):
-                    if self.c[i].sent_start != 0:
-                        break
-                else:
-                    raise ValueError(
-                        "Sentence boundaries unset. You can add the 'sentencizer' "
-                        "component to the pipeline with: "
-                        "nlp.add_pipe(nlp.create_pipe('sentencizer')) "
-                        "Alternatively, add the dependency parser, or set "
-                        "sentence boundaries by setting doc[i].sent_start")
-            start = 0
-            for i in range(1, self.length):
-                if self.c[i].sent_start == 1:
-                    yield Span(self, start, i)
-                    start = i
-            if start != self.length:
-                yield Span(self, start, self.length)
+                    if self.c[i].sent_start == 1:
+                        yield Span(self, start, i)
+                        start = i
+                if start != self.length:
+                    yield Span(self, start, self.length)
 
     cdef int push_back(self, LexemeOrToken lex_or_tok, bint has_space) except -1:
         if self.length == 0:
@@ -701,9 +709,12 @@ cdef class Doc:
                 for i in range(length):
                     if array[i, col] != 0:
                         self.vocab.morphology.assign_tag(&tokens[i], array[i, col])
-        set_children_from_heads(self.c, self.length)
+        # set flags
         self.is_parsed = bool(HEAD in attrs or DEP in attrs)
         self.is_tagged = bool(TAG in attrs or POS in attrs)
+        # if document is parsed, set children
+        if self.is_parsed:
+            set_children_from_heads(self.c, self.length)
         return self
 
     def get_lca_matrix(self):
@@ -779,7 +790,16 @@ cdef class Doc:
         RETURNS (bytes): A losslessly serialized copy of the `Doc`, including
             all annotations.
         """
-        array_head = [LENGTH, SPACY, TAG, LEMMA, HEAD, DEP, ENT_IOB, ENT_TYPE]
+        array_head = [LENGTH, SPACY, LEMMA, ENT_IOB, ENT_TYPE]
+
+        if self.is_tagged:
+            array_head.append(TAG)
+        # if doc parsed add head and dep attribute
+        if self.is_parsed:
+            array_head.extend([HEAD, DEP])
+        # otherwise add sent_start
+        else:
+            array_head.append(SENT_START)
         # Msgpack doesn't distinguish between lists and tuples, which is
         # vexing for user data. As a best guess, we *know* that within
         # keys, we must have tuples. In values we just have to hope

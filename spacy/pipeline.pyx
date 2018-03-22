@@ -25,6 +25,7 @@ from .morphology cimport Morphology
 from .vocab cimport Vocab
 from .syntax import nonproj
 from .compat import json_dumps
+from .matcher import Matcher
 
 from .attrs import POS
 from .parts_of_speech import X
@@ -68,6 +69,45 @@ class SentenceSegmenter(object):
         if start < len(doc):
             yield doc[start:len(doc)]
 
+
+def merge_noun_chunks(doc):
+    """Merge noun chunks into a single token.
+
+    doc (Doc): The Doc object.
+    RETURNS (Doc): The Doc object with merged noun chunks.
+    """
+    if not doc.is_parsed:
+        return
+    spans = [(np.start_char, np.end_char, np.root.tag, np.root.dep)
+             for np in doc.noun_chunks]
+    for start, end, tag, dep in spans:
+        doc.merge(start, end, tag=tag, dep=dep)
+    return doc
+
+
+def merge_entities(doc):
+    """Merge entities into a single token.
+
+    doc (Doc): The Doc object.
+    RETURNS (Doc): The Doc object with merged noun entities.
+    """
+    spans = [(e.start_char, e.end_char, e.root.tag, e.root.dep, e.label)
+             for e in doc.ents]
+    for start, end, tag, dep, ent_type in spans:
+        doc.merge(start, end, tag=tag, dep=dep, ent_type=ent_type)
+    return doc
+
+
+def merge_subtokens(doc, label='subtok'):
+    merger = Matcher(doc.vocab)
+    merger.add('SUBTOK', None, [{'DEP': label, 'op': '+'}])
+    matches = merger(doc)
+    spans = [doc[start:end+1] for _, start, end in matches]
+    offsets = [(span.start_char, span.end_char) for span in spans]
+    for start_char, end_char in offsets:
+        doc.merge(start_char, end_char)
+    return doc
+ 
 
 class Pipe(object):
     """This class is not instantiated directly. Components inherit from it, and
@@ -139,12 +179,13 @@ class Pipe(object):
         problem.
         """
         raise NotImplementedError
-    
+
     def create_optimizer(self):
         return create_default_optimizer(self.model.ops,
                                         **self.cfg.get('optimizer', {}))
 
-    def begin_training(self, gold_tuples=tuple(), pipeline=None, sgd=None):
+    def begin_training(self, gold_tuples=tuple(), pipeline=None, sgd=None,
+                       **kwargs):
         """Initialize the pipe for training, using data exampes if available.
         If no model has been initialized yet, the model is added."""
         if self.model is True:
@@ -174,7 +215,7 @@ class Pipe(object):
         """Load the pipe from a bytestring."""
         def load_model(b):
             if self.model is True:
-                self.cfg['pretrained_dims'] = self.vocab.vectors_length
+                self.cfg.setdefault('pretrained_dims', self.vocab.vectors_length)
                 self.model = self.Model(**self.cfg)
             self.model.from_bytes(b)
 
@@ -199,7 +240,7 @@ class Pipe(object):
         """Load the pipe from disk."""
         def load_model(p):
             if self.model is True:
-                self.cfg['pretrained_dims'] = self.vocab.vectors_length
+                self.cfg.setdefault('pretrained_dims', self.vocab.vectors_length)
                 self.model = self.Model(**self.cfg)
             self.model.from_bytes(p.open('rb').read())
 
@@ -214,7 +255,8 @@ class Pipe(object):
 
 def _load_cfg(path):
     if path.exists():
-        return ujson.load(path.open())
+        with path.open() as file_:
+            return ujson.load(file_)
     else:
         return {}
 
@@ -344,7 +386,8 @@ class Tensorizer(Pipe):
         loss = (d_scores**2).sum()
         return loss, d_scores
 
-    def begin_training(self, gold_tuples=tuple(), pipeline=None, sgd=None):
+    def begin_training(self, gold_tuples=tuple(), pipeline=None, sgd=None,
+                        **kwargs):
         """Allocate models, pre-process training data and acquire an
         optimizer.
 
@@ -467,7 +510,8 @@ class Tagger(Pipe):
         d_scores = self.model.ops.unflatten(d_scores, [len(d) for d in docs])
         return float(loss), d_scores
 
-    def begin_training(self, gold_tuples=tuple(), pipeline=None, sgd=None):
+    def begin_training(self, gold_tuples=tuple(), pipeline=None, sgd=None,
+                       **kwargs):
         orig_tag_map = dict(self.vocab.morphology.tag_map)
         new_tag_map = OrderedDict()
         for raw_text, annots_brackets in gold_tuples:
@@ -532,7 +576,7 @@ class Tagger(Pipe):
         else:
             serialize['model'] = self.model.to_bytes
         serialize['vocab'] = self.vocab.to_bytes
-
+        serialize['cfg'] = lambda: ujson.dumps(self.cfg)
         tag_map = OrderedDict(sorted(self.vocab.morphology.tag_map.items()))
         serialize['tag_map'] = lambda: msgpack.dumps(
             tag_map, use_bin_type=True, encoding='utf8')
@@ -565,7 +609,7 @@ class Tagger(Pipe):
         return self
 
     def to_disk(self, path, **exclude):
-        self.cfg['pretrained_dims'] = self.vocab.vectors.data.shape[1]
+        self.cfg.setdefault('pretrained_dims', self.vocab.vectors.data.shape[1])
         tag_map = OrderedDict(sorted(self.vocab.morphology.tag_map.items()))
         serialize = OrderedDict((
             ('vocab', lambda p: self.vocab.to_disk(p)),
@@ -580,7 +624,8 @@ class Tagger(Pipe):
         def load_model(p):
             if self.model is True:
                 self.model = self.Model(self.vocab.morphology.n_tags, **self.cfg)
-            self.model.from_bytes(p.open('rb').read())
+            with p.open('rb') as file_:
+                self.model.from_bytes(file_.read())
 
         def load_tag_map(p):
             with p.open('rb') as file_:
@@ -619,11 +664,13 @@ class MultitaskObjective(Tagger):
             self.make_label = self.make_dep_tag_offset
         elif target == 'ent_tag':
             self.make_label = self.make_ent_tag
+        elif target == 'sent_start':
+            self.make_label = self.make_sent_start
         elif hasattr(target, '__call__'):
             self.make_label = target
         else:
             raise ValueError("MultitaskObjective target should be function or "
-                             "one of: dep, tag, ent, dep_tag_offset, ent_tag.")
+                             "one of: dep, tag, ent, sent_start, dep_tag_offset, ent_tag.")
         self.cfg = dict(cfg)
         self.cfg.setdefault('cnn_maxout_pieces', 2)
         self.cfg.setdefault('pretrained_dims',
@@ -641,7 +688,7 @@ class MultitaskObjective(Tagger):
         pass
 
     def begin_training(self, gold_tuples=tuple(), pipeline=None, tok2vec=None,
-                       sgd=None):
+                       sgd=None, **kwargs):
         gold_tuples = nonproj.preprocess_training_data(gold_tuples)
         for raw_text, annots_brackets in gold_tuples:
             for annots, brackets in annots_brackets:
@@ -676,13 +723,15 @@ class MultitaskObjective(Tagger):
         return tokvecs, scores
 
     def get_loss(self, docs, golds, scores):
+        assert len(docs) == len(golds)
         cdef int idx = 0
         correct = numpy.zeros((scores.shape[0],), dtype='i')
         guesses = scores.argmax(axis=1)
-        for gold in golds:
-            for i in range(len(gold.labels)):
-                label = self.make_label(i, gold.words, gold.tags, gold.heads,
-                                        gold.labels, gold.ents)
+        for i, gold in enumerate(golds):
+            for j in range(len(docs[i])):
+                # Handes alignment for tokenization differences
+                label = self.make_label(j, gold.words, gold.tags,
+                                        gold.heads, gold.labels, gold.ents)
                 if label is None or label not in self.labels:
                     correct[idx] = guesses[idx]
                 else:
@@ -726,6 +775,51 @@ class MultitaskObjective(Tagger):
         else:
             return '%s-%s' % (tags[i], ents[i])
 
+    @staticmethod
+    def make_sent_start(target, words, tags, heads, deps, ents, cache=True, _cache={}):
+        '''A multi-task objective for representing sentence boundaries,
+        using BILU scheme. (O is impossible)
+
+        The implementation of this method uses an internal cache that relies
+        on the identity of the heads array, to avoid requiring a new piece
+        of gold data. You can pass cache=False if you know the cache will
+        do the wrong thing.
+        '''
+        assert len(words) == len(heads)
+        assert target < len(words), (target, len(words))
+        if cache:
+            if id(heads) in _cache:
+                return _cache[id(heads)][target]
+            else:
+                for key in list(_cache.keys()):
+                    _cache.pop(key)
+            sent_tags = ['I-SENT'] * len(words)
+            _cache[id(heads)] = sent_tags
+        else:
+            sent_tags = ['I-SENT'] * len(words)
+
+        def _find_root(child):
+            seen = set([child])
+            while child is not None and heads[child] != child:
+                seen.add(child)
+                child = heads[child]
+            return child
+
+        sentences = {}
+        for i in range(len(words)):
+            root = _find_root(i)
+            if root is None:
+                sent_tags[i] = None
+            else:
+                sentences.setdefault(root, []).append(i)
+        for root, span in sorted(sentences.items()):
+            if len(span) == 1:
+                sent_tags[span[0]] = 'U-SENT'
+            else:
+                sent_tags[span[0]] = 'B-SENT'
+                sent_tags[span[-1]] = 'L-SENT'
+        return sent_tags[target]
+
 
 class SimilarityHook(Pipe):
     """
@@ -766,7 +860,7 @@ class SimilarityHook(Pipe):
     def update(self, doc1_doc2, golds, sgd=None, drop=0.):
         sims, bp_sims = self.model.begin_update(doc1_doc2, drop=drop)
 
-    def begin_training(self, _=tuple(), pipeline=None, sgd=None):
+    def begin_training(self, _=tuple(), pipeline=None, sgd=None, **kwargs):
         """Allocate model, using width from tensorizer in pipeline.
 
         gold_tuples (iterable): Gold-standard training data.
@@ -784,8 +878,8 @@ class TextCategorizer(Pipe):
     name = 'textcat'
 
     @classmethod
-    def Model(cls, nr_class=1, width=64, **cfg):
-        return build_text_classifier(nr_class, width, **cfg)
+    def Model(cls, **cfg):
+        return build_text_classifier(**cfg)
 
     def __init__(self, vocab, model=True, **cfg):
         self.vocab = vocab
@@ -851,6 +945,15 @@ class TextCategorizer(Pipe):
         if label in self.labels:
             return 0
         if self.model not in (None, True, False):
+            # This functionality was available previously, but was broken.
+            # The problem is that we resize the last layer, but the last layer
+            # is actually just an ensemble. We're not resizing the child layers
+            # -- a huge problem.
+            raise ValueError(
+                "Cannot currently add labels to pre-trained text classifier. "
+                "Add labels before training begins. This functionality was "
+                "available in previous versions, but had significant bugs that "
+                "let to poor performance")
             smaller = self.model._layers[-1]
             larger = Affine(len(self.labels)+1, smaller.nI)
             copy_array(larger.W[:smaller.nO], smaller.W)
@@ -866,8 +969,9 @@ class TextCategorizer(Pipe):
             token_vector_width = 64
         if self.model is True:
             self.cfg['pretrained_dims'] = self.vocab.vectors_length
-            self.model = self.Model(len(self.labels), token_vector_width,
-                                    **self.cfg)
+            self.cfg['nr_class'] = len(self.labels)
+            self.cfg['width'] = token_vector_width
+            self.model = self.Model(**self.cfg)
             link_vectors_to_models(self.vocab)
         if sgd is None:
             sgd = self.create_optimizer()
@@ -881,7 +985,7 @@ cdef class DependencyParser(Parser):
     @property
     def postprocesses(self):
         return [nonproj.deprojectivize]
-    
+
     def add_multitask_objective(self, target):
         labeller = MultitaskObjective(self.vocab, target=target)
         self._multitasks.append(labeller)
@@ -891,7 +995,6 @@ cdef class DependencyParser(Parser):
             tok2vec = self.model[0]
             labeller.begin_training(gold_tuples, pipeline=pipeline,
                                     tok2vec=tok2vec, sgd=sgd)
-            pipeline.append((labeller.name, labeller))
 
     def __reduce__(self):
         return (DependencyParser, (self.vocab, self.moves, self.model),
@@ -903,7 +1006,7 @@ cdef class EntityRecognizer(Parser):
     TransitionSystem = BiluoPushDown
 
     nr_feature = 6
-    
+
     def add_multitask_objective(self, target):
         labeller = MultitaskObjective(self.vocab, target=target)
         self._multitasks.append(labeller)
@@ -913,7 +1016,6 @@ cdef class EntityRecognizer(Parser):
             tok2vec = self.model[0]
             labeller.begin_training(gold_tuples, pipeline=pipeline,
                                     tok2vec=tok2vec)
-            pipeline.append((labeller.name, labeller))
 
     def __reduce__(self):
         return (EntityRecognizer, (self.vocab, self.moves, self.model),
